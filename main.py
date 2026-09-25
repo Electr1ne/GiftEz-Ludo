@@ -3,6 +3,7 @@ import datetime
 import logging
 import os
 import random
+import sqlite3
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -19,7 +20,6 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-import aiosqlite
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -93,10 +93,11 @@ class AdminStates(StatesGroup):
     waiting_for_mute_time = State()
 
 
-# ==================== БАЗА ДАННЫХ И МИГРАЦИИ ====================
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
+# ==================== БАЗА ДАННЫХ И МИГРАЦИИ (SQLITE3) ====================
+def _db_init_sync():
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -108,7 +109,7 @@ async def init_db():
             )
         """
         )
-        await db.execute(
+        cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS chats (
                 chat_id INTEGER PRIMARY KEY,
@@ -116,7 +117,7 @@ async def init_db():
             )
         """
         )
-        await db.execute(
+        cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS inventory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,7 +130,7 @@ async def init_db():
             )
         """
         )
-        await db.execute(
+        cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -148,41 +149,53 @@ async def init_db():
             ('warn_mute_time', '1440'),
         ]
         for key, val in default_settings:
-            await db.execute(
+            cursor.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                 (key, val),
             )
 
-        async with db.execute("PRAGMA table_info(users)") as cursor:
-            columns = [row[1] for row in await cursor.fetchall()]
-            if "warnings" not in columns:
-                await db.execute(
-                    "ALTER TABLE users ADD COLUMN warnings INTEGER DEFAULT 0"
-                )
-            if "is_banned" not in columns:
-                await db.execute(
-                    "ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0"
-                )
+        cursor.execute("PRAGMA table_info(users)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "warnings" not in columns:
+            cursor.execute(
+                "ALTER TABLE users ADD COLUMN warnings INTEGER DEFAULT 0"
+            )
+        if "is_banned" not in columns:
+            cursor.execute(
+                "ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0"
+            )
 
-        await db.commit()
+        db.commit()
+
+
+async def init_db():
+    await asyncio.to_thread(_db_init_sync)
+
+
+def _get_setting_sync(key: str, default: str = "") -> str:
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = cursor.fetchone()
+        return row[0] if row else default
 
 
 async def get_setting(key: str, default: str = "") -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT value FROM settings WHERE key = ?", (key,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else default
+    return await asyncio.to_thread(_get_setting_sync, key, default)
 
 
-async def set_setting(key: str, value: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
+def _set_setting_sync(key: str, value: str):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
             (key, str(value)),
         )
-        await db.commit()
+        db.commit()
+
+
+async def set_setting(key: str, value: str):
+    await asyncio.to_thread(_set_setting_sync, key, value)
 
 
 async def get_spin_price() -> int:
@@ -194,9 +207,10 @@ async def set_spin_price(price: int):
     await set_setting('spin_price', str(price))
 
 
-async def register_user(user_id: int, username: Optional[str], full_name: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
+def _register_user_sync(user_id: int, username: Optional[str], full_name: str):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute(
             """
             INSERT INTO users (user_id, username, full_name, spins_count, warnings, is_banned)
             VALUES (?, ?, ?, 0, 0, 0)
@@ -206,55 +220,74 @@ async def register_user(user_id: int, username: Optional[str], full_name: str):
         """,
             (user_id, username or "", full_name),
         )
-        await db.commit()
+        db.commit()
+
+
+async def register_user(user_id: int, username: Optional[str], full_name: str):
+    await asyncio.to_thread(_register_user_sync, user_id, username, full_name)
+
+
+def _is_user_banned_sync(user_id: int) -> bool:
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT is_banned FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        return bool(row[0]) if row else False
 
 
 async def is_user_banned(user_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT is_banned FROM users WHERE user_id = ?", (user_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return bool(row[0]) if row else False
+    return await asyncio.to_thread(_is_user_banned_sync, user_id)
 
 
-async def increment_user_spins(user_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
+def _increment_user_spins_sync(user_id: int) -> int:
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute(
             "UPDATE users SET spins_count = spins_count + 1 WHERE user_id = ?",
             (user_id,),
         )
-        await db.commit()
-        async with db.execute(
-            "SELECT spins_count FROM users WHERE user_id = ?", (user_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 1
+        db.commit()
+        cursor.execute("SELECT spins_count FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        return row[0] if row else 1
+
+
+async def increment_user_spins(user_id: int) -> int:
+    return await asyncio.to_thread(_increment_user_spins_sync, user_id)
+
+
+def _reset_user_spins_sync(user_id: int):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute(
+            "UPDATE users SET spins_count = 0 WHERE user_id = ?", (user_id,)
+        )
+        db.commit()
 
 
 async def reset_user_spins(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET spins_count = 0 WHERE user_id = ?", (user_id,)
-        )
-        await db.commit()
+    await asyncio.to_thread(_reset_user_spins_sync, user_id)
 
 
-async def register_chat(chat_id: int, title: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
+def _register_chat_sync(chat_id: int, title: str):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute(
             "INSERT OR REPLACE INTO chats (chat_id, title) VALUES (?, ?)",
             (chat_id, title),
         )
-        await db.commit()
+        db.commit()
 
 
-async def add_item_to_inventory(
-    user_id: int, username: str, gift_key: str
-) -> int:
+async def register_chat(chat_id: int, title: str):
+    await asyncio.to_thread(_register_chat_sync, chat_id, title)
+
+
+def _add_item_to_inventory_sync(user_id: int, username: str, gift_key: str) -> int:
     config = GIFTS_CONFIG[gift_key]
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute(
             """
             INSERT INTO inventory (user_id, username, gift_key, stars, payout, status)
             VALUES (?, ?, ?, ?, ?, 'available')
@@ -267,55 +300,87 @@ async def add_item_to_inventory(
                 config["payout"],
             ),
         )
-        await db.commit()
+        db.commit()
         return cursor.lastrowid
 
 
-async def update_item_status(item_id: int, status: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
+async def add_item_to_inventory(user_id: int, username: str, gift_key: str) -> int:
+    return await asyncio.to_thread(_add_item_to_inventory_sync, user_id, username, gift_key)
+
+
+def _update_item_status_sync(item_id: int, status: str):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute(
             "UPDATE inventory SET status = ? WHERE id = ?", (status, item_id)
         )
-        await db.commit()
+        db.commit()
+
+
+async def update_item_status(item_id: int, status: str):
+    await asyncio.to_thread(_update_item_status_sync, item_id, status)
+
+
+def _delete_item_sync(item_id: int):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute("DELETE FROM inventory WHERE id = ?", (item_id,))
+        db.commit()
 
 
 async def delete_item(item_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM inventory WHERE id = ?", (item_id,))
-        await db.commit()
+    await asyncio.to_thread(_delete_item_sync, item_id)
+
+
+def _clear_user_inventory_sync(user_id: int):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute("DELETE FROM inventory WHERE user_id = ?", (user_id,))
+        db.commit()
 
 
 async def clear_user_inventory(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM inventory WHERE user_id = ?", (user_id,))
-        await db.commit()
+    await asyncio.to_thread(_clear_user_inventory_sync, user_id)
+
+
+def _get_item_by_id_sync(item_id: int):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT id, user_id, username, gift_key, stars, payout, status FROM inventory WHERE id = ?",
+            (item_id,),
+        )
+        return cursor.fetchone()
 
 
 async def get_item_by_id(item_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id, user_id, username, gift_key, stars, payout, status FROM inventory WHERE id = ?",
-            (item_id,),
-        ) as cursor:
-            return await cursor.fetchone()
+    return await asyncio.to_thread(_get_item_by_id_sync, item_id)
+
+
+def _get_user_items_sync(user_id: int):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT id, gift_key, stars, payout, status FROM inventory WHERE user_id = ?",
+            (user_id,),
+        )
+        return cursor.fetchall()
 
 
 async def get_user_items(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id, gift_key, stars, payout, status FROM inventory WHERE user_id = ?",
-            (user_id,),
-        ) as cursor:
-            return await cursor.fetchall()
+    return await asyncio.to_thread(_get_user_items_sync, user_id)
+
+
+def _get_pending_withdrawals_count_sync() -> int:
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT COUNT(*) FROM inventory WHERE status = 'pending'")
+        row = cursor.fetchone()
+        return row[0] if row else 0
 
 
 async def get_pending_withdrawals_count() -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT COUNT(*) FROM inventory WHERE status = 'pending'"
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
+    return await asyncio.to_thread(_get_pending_withdrawals_count_sync)
 
 
 # ==================== ДИНАМИЧЕСКИЙ РАСЧЕТ ШАНСОВ ====================
@@ -578,35 +643,44 @@ def get_mod_menu_kb():
 
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ НАКАЗАНИЯ ====================
-async def apply_warn(user_id: int, chat_id: Optional[int] = None) -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
+def _apply_warn_sync(user_id: int) -> int:
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute(
             "UPDATE users SET warnings = warnings + 1 WHERE user_id = ?", (user_id,)
         )
-        await db.commit()
-        async with db.execute(
-            "SELECT warnings FROM users WHERE user_id = ?", (user_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            warns = row[0] if row else 1
+        db.commit()
+        cursor.execute("SELECT warnings FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        return row[0] if row else 1
 
+
+def _reset_warns_sync(user_id: int):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute("UPDATE users SET warnings = 0 WHERE user_id = ?", (user_id,))
+        db.commit()
+
+
+def _set_banned_sync(user_id: int, banned: int):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (banned, user_id))
+        db.commit()
+
+
+async def apply_warn(user_id: int, chat_id: Optional[int] = None) -> str:
+    warns = await asyncio.to_thread(_apply_warn_sync, user_id)
     limit = int(await get_setting("warn_limit", "4"))
+
     if warns >= limit:
         action = await get_setting("warn_punishment", "mute")
         mute_mins = int(await get_setting("warn_mute_time", "1440"))
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE users SET warnings = 0 WHERE user_id = ?", (user_id,)
-            )
-            await db.commit()
+        await asyncio.to_thread(_reset_warns_sync, user_id)
 
         if action == "ban":
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "UPDATE users SET is_banned = 1 WHERE user_id = ?", (user_id,)
-                )
-                await db.commit()
+            await asyncio.to_thread(_set_banned_sync, user_id, 1)
             if chat_id:
                 try:
                     await bot.ban_chat_member(chat_id, user_id)
@@ -742,25 +816,31 @@ async def process_clear_my_inventory(callback: CallbackQuery):
     await show_inventory(callback.from_user.id, callback)
 
 
+def _get_profile_data_sync(user_id: int):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute(
+            "SELECT spins_count, warnings, is_banned FROM users WHERE user_id = ?",
+            (user_id,),
+        )
+        row = cursor.fetchone()
+        spins = row[0] if row else 0
+        warns = row[1] if row else 0
+
+        cursor.execute(
+            "SELECT COUNT(*) FROM inventory WHERE user_id = ?", (user_id,)
+        )
+        inv_cnt = cursor.fetchone()[0]
+        return spins, warns, inv_cnt
+
+
 @router.callback_query(F.data == "open_profile")
 async def process_open_profile(callback: CallbackQuery):
     if await is_user_banned(callback.from_user.id):
         return
 
     user_id = callback.from_user.id
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT spins_count, warnings, is_banned FROM users WHERE user_id = ?",
-            (user_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-            spins = row[0] if row else 0
-            warns = row[1] if row else 0
-
-        async with db.execute(
-            "SELECT COUNT(*) FROM inventory WHERE user_id = ?", (user_id,)
-        ) as cursor:
-            inv_cnt = (await cursor.fetchone())[0]
+    spins, warns, inv_cnt = await asyncio.to_thread(_get_profile_data_sync, user_id)
 
     limit = await get_setting("warn_limit", "4")
     username = f"@{callback.from_user.username}" if callback.from_user.username else "Отсутствует"
@@ -826,12 +906,7 @@ async def handle_dice(message: Message):
         mute_time = int(await get_setting("forward_mute_time", "60"))
 
         if punishment == "ban":
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "UPDATE users SET is_banned = 1 WHERE user_id = ?",
-                    (message.from_user.id,),
-                )
-                await db.commit()
+            await asyncio.to_thread(_set_banned_sync, message.from_user.id, 1)
             try:
                 await message.chat.ban_member(message.from_user.id)
             except Exception:
@@ -1085,6 +1160,20 @@ async def cmd_testludka(message: Message):
 
 
 # ==================== УПРАВЛЕНИЕ ЗАЯВКАМИ НА ВЫВОД B АДМИНКЕ ====================
+def _get_admin_withdrawals_sync(limit: int, offset: int):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT COUNT(*) FROM inventory WHERE status='pending'")
+        total_pending = cursor.fetchone()[0]
+
+        cursor.execute(
+            "SELECT id, user_id, username, gift_key, stars, payout FROM inventory WHERE status='pending' LIMIT ? OFFSET ?",
+            (limit, offset),
+        )
+        items = cursor.fetchall()
+        return total_pending, items
+
+
 @router.callback_query(F.data.startswith("admin_withdrawals_"))
 async def process_admin_withdrawals_list(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -1094,17 +1183,7 @@ async def process_admin_withdrawals_list(callback: CallbackQuery):
     limit = 5
     offset = page * limit
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT COUNT(*) FROM inventory WHERE status='pending'"
-        ) as c:
-            total_pending = (await c.fetchone())[0]
-
-        async with db.execute(
-            "SELECT id, user_id, username, gift_key, stars, payout FROM inventory WHERE status='pending' LIMIT ? OFFSET ?",
-            (limit, offset),
-        ) as cursor:
-            items = await cursor.fetchall()
+    total_pending, items = await asyncio.to_thread(_get_admin_withdrawals_sync, limit, offset)
 
     if not items:
         text = "📥 <b>Активных заявок на вывод нет.</b>"
@@ -1305,11 +1384,7 @@ async def cmd_ban(message: Message):
         )
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET is_banned = 1 WHERE user_id = ?", (target_id,)
-        )
-        await db.commit()
+    await asyncio.to_thread(_set_banned_sync, target_id, 1)
 
     try:
         await message.chat.ban_member(target_id)
@@ -1333,11 +1408,7 @@ async def cmd_unban(message: Message):
         )
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET is_banned = 0 WHERE user_id = ?", (target_id,)
-        )
-        await db.commit()
+    await asyncio.to_thread(_set_banned_sync, target_id, 0)
 
     try:
         await message.chat.unban_member(target_id)
@@ -1350,6 +1421,20 @@ async def cmd_unban(message: Message):
 
 
 # ==================== СПИСОК ПОЛЬЗОВАТЕЛЕЙ (ПАГИНАЦИЯ) ====================
+def _get_users_list_sync(limit: int, offset: int):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0]
+
+        cursor.execute(
+            "SELECT user_id, username, full_name, spins_count, warnings, is_banned FROM users LIMIT ? OFFSET ?",
+            (limit, offset),
+        )
+        users = cursor.fetchall()
+        return total_users, users
+
+
 @router.callback_query(F.data.startswith("users_list_"))
 async def process_users_list(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -1359,15 +1444,7 @@ async def process_users_list(callback: CallbackQuery):
     limit = 5
     offset = page * limit
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as c:
-            total_users = (await c.fetchone())[0]
-
-        async with db.execute(
-            "SELECT user_id, username, full_name, spins_count, warnings, is_banned FROM users LIMIT ? OFFSET ?",
-            (limit, offset),
-        ) as cursor:
-            users = await cursor.fetchall()
+    total_users, users = await asyncio.to_thread(_get_users_list_sync, limit, offset)
 
     if not users:
         text = "👥 <b>Список пользователей пуст.</b>"
@@ -1672,6 +1749,23 @@ async def process_mod_action_select(
     await callback.answer()
 
 
+def _unwarn_user_sync(user_id: int, amount: int = 1):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute(
+            "UPDATE users SET warnings = MAX(0, warnings - ?) WHERE user_id = ?",
+            (amount, user_id),
+        )
+        db.commit()
+
+
+def _clear_warns_sync(user_id: int):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute("UPDATE users SET warnings = 0 WHERE user_id = ?", (user_id,))
+        db.commit()
+
+
 @router.message(AdminStates.waiting_for_mod_user_id)
 async def process_execute_mod_action(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
@@ -1685,59 +1779,47 @@ async def process_execute_mod_action(message: Message, state: FSMContext):
     data = await state.get_data()
     action = data.get("mod_action")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        if action == "ban":
-            await db.execute(
-                "UPDATE users SET is_banned = 1 WHERE user_id = ?", (target_id,)
-            )
-            await message.answer(f"🚫 Пользователь <code>{target_id}</code> забанен.")
-            await state.clear()
-        elif action == "unban":
-            await db.execute(
-                "UPDATE users SET is_banned = 0 WHERE user_id = ?", (target_id,)
-            )
-            await message.answer(f"🟢 Пользователь <code>{target_id}</code> разбанен.")
-            await state.clear()
-        elif action == "warn":
-            res = await apply_warn(target_id)
-            await message.answer(
-                f"⚠️ Выдан варн пользователю <code>{target_id}</code>. {res}"
-            )
-            await state.clear()
-        elif action == "unwarn_one":
-            await db.execute(
-                "UPDATE users SET warnings = MAX(0, warnings - 1) WHERE user_id = ?",
-                (target_id,),
-            )
-            await message.answer(f"🧹 Снят 1 варн с пользователя <code>{target_id}</code>.")
-            await state.clear()
-        elif action == "unwarn_all":
-            await db.execute(
-                "UPDATE users SET warnings = 0 WHERE user_id = ?", (target_id,)
-            )
-            await message.answer(f"✨ Сняты ВСЕ варны с пользователя <code>{target_id}</code>.")
-            await state.clear()
-        elif action == "unwarn_num":
-            await state.update_data(target_id=target_id)
-            await state.set_state(AdminStates.waiting_for_unwarn_amount)
-            await message.answer("🔢 Введите количество варнов, которое нужно снять:")
-            return
-        elif action == "mute":
-            await message.answer(
-                f"🔇 Воспользуйтесь командой <code>/mute {target_id} [минуты]</code> прямо в чате."
-            )
-            await state.clear()
-        elif action == "unmute":
-            await message.answer(
-                f"🔊 Воспользуйтесь командой <code>/unmute {target_id}</code> прямо в чате."
-            )
-            await state.clear()
-        elif action == "clear_inv":
-            await clear_user_inventory(target_id)
-            await message.answer(f"🗑️ Инвентарь пользователя <code>{target_id}</code> полностью очищен.")
-            await state.clear()
-
-        await db.commit()
+    if action == "ban":
+        await asyncio.to_thread(_set_banned_sync, target_id, 1)
+        await message.answer(f"🚫 Пользователь <code>{target_id}</code> забанен.")
+        await state.clear()
+    elif action == "unban":
+        await asyncio.to_thread(_set_banned_sync, target_id, 0)
+        await message.answer(f"🟢 Пользователь <code>{target_id}</code> разбанен.")
+        await state.clear()
+    elif action == "warn":
+        res = await apply_warn(target_id)
+        await message.answer(
+            f"⚠️ Выдан варн пользователю <code>{target_id}</code>. {res}"
+        )
+        await state.clear()
+    elif action == "unwarn_one":
+        await asyncio.to_thread(_unwarn_user_sync, target_id, 1)
+        await message.answer(f"🧹 Снят 1 варн с пользователя <code>{target_id}</code>.")
+        await state.clear()
+    elif action == "unwarn_all":
+        await asyncio.to_thread(_clear_warns_sync, target_id)
+        await message.answer(f"✨ Сняты ВСЕ варны с пользователя <code>{target_id}</code>.")
+        await state.clear()
+    elif action == "unwarn_num":
+        await state.update_data(target_id=target_id)
+        await state.set_state(AdminStates.waiting_for_unwarn_amount)
+        await message.answer("🔢 Введите количество варнов, которое нужно снять:")
+        return
+    elif action == "mute":
+        await message.answer(
+            f"🔇 Воспользуйтесь командой <code>/mute {target_id} [минуты]</code> прямо в чате."
+        )
+        await state.clear()
+    elif action == "unmute":
+        await message.answer(
+            f"🔊 Воспользуйтесь командой <code>/unmute {target_id}</code> прямо в чате."
+        )
+        await state.clear()
+    elif action == "clear_inv":
+        await clear_user_inventory(target_id)
+        await message.answer(f"🗑️ Инвентарь пользователя <code>{target_id}</code> полностью очищен.")
+        await state.clear()
 
 
 @router.message(AdminStates.waiting_for_unwarn_amount)
@@ -1753,12 +1835,7 @@ async def process_execute_unwarn_amount(message: Message, state: FSMContext):
     data = await state.get_data()
     target_id = data.get("target_id")
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET warnings = MAX(0, warnings - ?) WHERE user_id = ?",
-            (amount, target_id),
-        )
-        await db.commit()
+    await asyncio.to_thread(_unwarn_user_sync, target_id, amount)
 
     await message.answer(
         f"🧹 Снято <b>{amount}</b> варнов у пользователя <code>{target_id}</code>.",
@@ -1881,22 +1958,26 @@ async def process_delete_item(callback: CallbackQuery):
         pass
 
 
+def _get_admin_stats_sync():
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        users_cnt = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM chats")
+        chats_cnt = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM inventory")
+        total_wins = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM inventory WHERE status='pending'")
+        pending_cnt = cursor.fetchone()[0]
+        return users_cnt, chats_cnt, total_wins, pending_cnt
+
+
 @router.callback_query(F.data == "admin_stats")
 async def process_admin_stats(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as c:
-            users_cnt = (await c.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM chats") as c:
-            chats_cnt = (await c.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM inventory") as c:
-            total_wins = (await c.fetchone())[0]
-        async with db.execute(
-            "SELECT COUNT(*) FROM inventory WHERE status='pending'"
-        ) as c:
-            pending_cnt = (await c.fetchone())[0]
+    users_cnt, chats_cnt, total_wins, pending_cnt = await asyncio.to_thread(_get_admin_stats_sync)
 
     spin_price = await get_spin_price()
     kb = await get_admin_panel_kb(spin_price)
@@ -1937,6 +2018,16 @@ async def process_broadcast_start(
     await callback.answer()
 
 
+def _get_broadcast_targets_sync(target: str):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        if target == "pm":
+            cursor.execute("SELECT user_id FROM users")
+        else:
+            cursor.execute("SELECT chat_id FROM chats")
+        return [row[0] for row in cursor.fetchall()]
+
+
 @router.message(AdminStates.waiting_for_broadcast_message)
 async def process_broadcast_send(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
@@ -1945,13 +2036,7 @@ async def process_broadcast_send(message: Message, state: FSMContext):
     data = await state.get_data()
     target = data["target"]
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        if target == "pm":
-            async with db.execute("SELECT user_id FROM users") as c:
-                targets = [row[0] for row in await c.fetchall()]
-        else:
-            async with db.execute("SELECT chat_id FROM chats") as c:
-                targets = [row[0] for row in await c.fetchall()]
+    targets = await asyncio.to_thread(_get_broadcast_targets_sync, target)
 
     success, failed = 0, 0
     for tid in targets:
