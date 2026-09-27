@@ -7,27 +7,30 @@ import sqlite3
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ChatMemberStatus
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
+from aiogram.filters.chat_member_updated import ChatMemberUpdatedFilter, JOIN_TRANSITION, LEAVE_TRANSITION
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
+    ChatMemberUpdated,
     ChatPermissions,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
 )
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # ==================== НАСТРОЙКИ ИЗ .ENV ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+
+# Имя единственной разрешенной группы
+ALLOWED_GROUP_USERNAME = "giftezludochat"
 
 # Конфигурация подарков и привязанных к ним файлов
 GIFTS_CONFIG = {
@@ -113,7 +116,8 @@ def _db_init_sync():
             """
             CREATE TABLE IF NOT EXISTS chats (
                 chat_id INTEGER PRIMARY KEY,
-                title TEXT
+                title TEXT,
+                username TEXT
             )
         """
         )
@@ -126,7 +130,8 @@ def _db_init_sync():
                 gift_key TEXT,
                 stars INTEGER,
                 payout INTEGER,
-                status TEXT DEFAULT 'available'
+                status TEXT DEFAULT 'available',
+                chat_id INTEGER DEFAULT 0
             )
         """
         )
@@ -147,6 +152,7 @@ def _db_init_sync():
             ('warn_limit', '4'),
             ('warn_punishment', 'mute'),
             ('warn_mute_time', '1440'),
+            ('auto_leave_other_chats', '1'),
         ]
         for key, val in default_settings:
             cursor.execute(
@@ -163,6 +169,20 @@ def _db_init_sync():
         if "is_banned" not in columns:
             cursor.execute(
                 "ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0"
+            )
+
+        cursor.execute("PRAGMA table_info(inventory)")
+        inv_columns = [row[1] for row in cursor.fetchall()]
+        if "chat_id" not in inv_columns:
+            cursor.execute(
+                "ALTER TABLE inventory ADD COLUMN chat_id INTEGER DEFAULT 0"
+            )
+
+        cursor.execute("PRAGMA table_info(chats)")
+        chats_columns = [row[1] for row in cursor.fetchall()]
+        if "username" not in chats_columns:
+            cursor.execute(
+                "ALTER TABLE chats ADD COLUMN username TEXT"
             )
 
         db.commit()
@@ -269,28 +289,28 @@ async def reset_user_spins(user_id: int):
     await asyncio.to_thread(_reset_user_spins_sync, user_id)
 
 
-def _register_chat_sync(chat_id: int, title: str):
+def _register_chat_sync(chat_id: int, title: str, username: str = ""):
     with sqlite3.connect(DB_PATH) as db:
         cursor = db.cursor()
         cursor.execute(
-            "INSERT OR REPLACE INTO chats (chat_id, title) VALUES (?, ?)",
-            (chat_id, title),
+            "INSERT OR REPLACE INTO chats (chat_id, title, username) VALUES (?, ?, ?)",
+            (chat_id, title, username or ""),
         )
         db.commit()
 
 
-async def register_chat(chat_id: int, title: str):
-    await asyncio.to_thread(_register_chat_sync, chat_id, title)
+async def register_chat(chat_id: int, title: str, username: str = ""):
+    await asyncio.to_thread(_register_chat_sync, chat_id, title, username)
 
 
-def _add_item_to_inventory_sync(user_id: int, username: str, gift_key: str) -> int:
+def _add_item_to_inventory_sync(user_id: int, username: str, gift_key: str, chat_id: int = 0) -> int:
     config = GIFTS_CONFIG[gift_key]
     with sqlite3.connect(DB_PATH) as db:
         cursor = db.cursor()
         cursor.execute(
             """
-            INSERT INTO inventory (user_id, username, gift_key, stars, payout, status)
-            VALUES (?, ?, ?, ?, ?, 'available')
+            INSERT INTO inventory (user_id, username, gift_key, stars, payout, status, chat_id)
+            VALUES (?, ?, ?, ?, ?, 'available', ?)
         """,
             (
                 user_id,
@@ -298,14 +318,15 @@ def _add_item_to_inventory_sync(user_id: int, username: str, gift_key: str) -> i
                 gift_key,
                 config["stars"],
                 config["payout"],
+                chat_id
             ),
         )
         db.commit()
         return cursor.lastrowid
 
 
-async def add_item_to_inventory(user_id: int, username: str, gift_key: str) -> int:
-    return await asyncio.to_thread(_add_item_to_inventory_sync, user_id, username, gift_key)
+async def add_item_to_inventory(user_id: int, username: str, gift_key: str, chat_id: int = 0) -> int:
+    return await asyncio.to_thread(_add_item_to_inventory_sync, user_id, username, gift_key, chat_id)
 
 
 def _update_item_status_sync(item_id: int, status: str):
@@ -341,6 +362,43 @@ def _clear_user_inventory_sync(user_id: int):
 
 async def clear_user_inventory(user_id: int):
     await asyncio.to_thread(_clear_user_inventory_sync, user_id)
+
+
+def _clear_all_inventories_sync():
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute("DELETE FROM inventory")
+        db.commit()
+
+
+async def clear_all_inventories():
+    await asyncio.to_thread(_clear_all_inventories_sync)
+
+
+def _clear_bugged_pm_gifts_sync() -> int:
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute("DELETE FROM inventory WHERE chat_id = 0 OR chat_id > 0")
+        deleted = cursor.rowcount
+        db.commit()
+        return deleted
+
+
+async def clear_bugged_pm_gifts() -> int:
+    return await asyncio.to_thread(_clear_bugged_pm_gifts_sync)
+
+
+def _clear_all_pending_withdrawals_sync() -> int:
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute("UPDATE inventory SET status = 'available' WHERE status = 'pending'")
+        count = cursor.rowcount
+        db.commit()
+        return count
+
+
+async def clear_all_pending_withdrawals() -> int:
+    return await asyncio.to_thread(_clear_all_pending_withdrawals_sync)
 
 
 def _get_item_by_id_sync(item_id: int):
@@ -384,7 +442,9 @@ async def get_pending_withdrawals_count() -> int:
 
 
 # ==================== ДИНАМИЧЕСКИЙ РАСЧЕТ ШАНСОВ ====================
-def select_gift_by_spins(spent_stars: int) -> str:
+def select_gift_by_spins(spent_stars: int, spin_price: int = 1) -> str:
+    spins_count = spent_stars // (spin_price if spin_price > 0 else 1)
+
     if spent_stars >= 55:
         weights = {
             "bear": 50,
@@ -415,6 +475,26 @@ def select_gift_by_spins(spent_stars: int) -> str:
             "cake": 35,
             "rocket": 10,
         }
+
+    extra_spins = spins_count - 15
+    if extra_spins >= 2:
+        min_payout = min(GIFTS_CONFIG[k]["payout"] for k in weights.keys())
+        cheapest_keys = [k for k in weights.keys() if GIFTS_CONFIG[k]["payout"] == min_payout]
+
+        reduction_factor = max(0.0, 1.0 - (extra_spins * 0.25))
+
+        removed_weight = 0
+        for ck in cheapest_keys:
+            old_w = weights[ck]
+            new_w = int(old_w * reduction_factor)
+            weights[ck] = new_w
+            removed_weight += (old_w - new_w)
+
+        expensive_keys = [k for k in weights.keys() if k not in cheapest_keys]
+        if expensive_keys and removed_weight > 0:
+            add_per_key = removed_weight // len(expensive_keys)
+            for ek in expensive_keys:
+                weights[ek] += add_per_key
 
     keys = list(weights.keys())
     w_list = [weights[k] for k in keys]
@@ -545,6 +625,16 @@ async def get_admin_panel_kb(spin_price: int):
                 InlineKeyboardButton(
                     text=withdraw_btn_text,
                     callback_data="admin_withdrawals_0",
+                ),
+                InlineKeyboardButton(
+                    text="🧹 Очистить список заявок",
+                    callback_data="clear_pending_withdrawals",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⚙️ Управление Подключённой Группой",
+                    callback_data="admin_chats_menu",
                 )
             ],
             [
@@ -564,7 +654,7 @@ async def get_admin_panel_kb(spin_price: int):
                     text="📢 Рассылка в ЛС", callback_data="broadcast_pm"
                 ),
                 InlineKeyboardButton(
-                    text="💬 Рассылка в Группы", callback_data="broadcast_chats"
+                    text="💬 Рассылка в Группу", callback_data="broadcast_chats"
                 ),
             ],
             [
@@ -631,6 +721,14 @@ def get_mod_menu_kb():
             [
                 InlineKeyboardButton(
                     text="🗑️ Очистить инвентарь юзера", callback_data="mod_act_clear_inv"
+                ),
+                InlineKeyboardButton(
+                    text="💥 Очистить ВСЕМ инвентарь", callback_data="mod_act_clear_all_inv"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧹 Удалить багованные подарки (из ЛС)", callback_data="mod_act_clear_bugged_gifts"
                 )
             ],
             [
@@ -706,6 +804,54 @@ async def apply_warn(user_id: int, chat_id: Optional[int] = None) -> str:
     return f"⚠️ Выдан варн ({warns}/{limit})."
 
 
+# ==================== ПРОВЕРКА И ЗАЩИТА ГРУППЫ ====================
+@router.my_chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
+async def on_bot_added_to_chat(event: ChatMemberUpdated):
+    chat = event.chat
+    if chat.type in ["group", "supergroup"]:
+        chat_uname = (chat.username or "").lower()
+        if chat_uname != ALLOWED_GROUP_USERNAME.lower():
+            try:
+                await bot.send_message(
+                    chat.id,
+                    f"❌ Бот предназначен для работы только в официальном чате @{ALLOWED_GROUP_USERNAME}!\nПокидаю эту группу."
+                )
+            except Exception:
+                pass
+            try:
+                await bot.leave_chat(chat.id)
+            except Exception:
+                pass
+
+            if ADMIN_ID:
+                try:
+                    await bot.send_message(
+                        ADMIN_ID,
+                        f"⚠️ <b>Попытка подключения бота в левую группу!</b>\n\n"
+                        f"📌 Название: {chat.title}\n"
+                        f"🆔 ID: <code>{chat.id}</code>\n"
+                        f"🔗 Юзернейм: @{chat.username if chat.username else 'отсутствует'}\n"
+                        f"🚀 <i>Бот автоматически вышел из этой группы.</i>",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+        else:
+            await register_chat(chat.id, chat.title or "Группа", chat_uname)
+            if ADMIN_ID:
+                try:
+                    await bot.send_message(
+                        ADMIN_ID,
+                        f"✅ <b>Официальная группа успешно подключена!</b>\n\n"
+                        f"📌 Название: {chat.title}\n"
+                        f"🆔 ID: <code>{chat.id}</code>\n"
+                        f"🔗 Юзернейм: @{chat.username}",
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
+
+
 # ==================== ХЭНДЛЕРЫ ПОЛЬЗОВАТЕЛЯ ====================
 @router.message(Command("start"))
 async def cmd_start(message: Message):
@@ -720,9 +866,9 @@ async def cmd_start(message: Message):
             message.from_user.full_name,
         )
         await message.answer(
-            "👋 <b>Добро пожаловать в GiftEz Ludo Bot!</b>\n\n"
-            "🎰 Крутите слот 🎰 в нашей группе. Если выпадает <b>777</b>, вы получаете подарок из Звёзд!\n"
-            "Все выигрыши сохраняются в вашем инвентаре.",
+            f"👋 <b>Добро пожаловать в GiftEz Ludo Bot!</b>\n\n"
+            f"🎰 Крутите слот 🎰 в нашей группе @{ALLOWED_GROUP_USERNAME}. Если выпадает <b>777</b>, вы получаете подарок из Звёзд!\n"
+            f"Все выигрыши сохраняются в вашем инвентаре.",
             parse_mode="HTML",
             reply_markup=get_bot_start_kb(message.from_user.id),
         )
@@ -734,9 +880,9 @@ async def process_back_to_start(callback: CallbackQuery):
         return
     try:
         await callback.message.edit_text(
-            "👋 <b>Главное меню GiftEz Ludo Bot</b>\n\n"
-            "🎰 Крутите слот 🎰 в нашей группе. Если выпадает <b>777</b>, вы получаете подарок из Звёзд!\n"
-            "Все выигрыши сохраняются в вашем инвентаре.",
+            f"👋 <b>Главное меню GiftEz Ludo Bot</b>\n\n"
+            f"🎰 Крутите слот 🎰 в нашей группе @{ALLOWED_GROUP_USERNAME}. Если выпадает <b>777</b>, вы получаете подарок из Звёзд!\n"
+            f"Все выигрыши сохраняются в вашем инвентаре.",
             parse_mode="HTML",
             reply_markup=get_bot_start_kb(callback.from_user.id),
         )
@@ -758,7 +904,7 @@ async def show_inventory(user_id: int, message_or_call):
     available_items = [i for i in items if i[4] == "available"]
 
     if not available_items:
-        text = "🎒 <b>Ваш инвентарь пуст.</b>\n\nКрутите 🎰 в группе, чтобы выиграть призы!"
+        text = f"🎒 <b>Ваш инвентарь пуст.</b>\n\nКрутите 🎰 в группе @{ALLOWED_GROUP_USERNAME}, чтобы выиграть призы!"
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -800,11 +946,58 @@ async def process_open_inventory(callback: CallbackQuery):
         await callback.answer("❌ Вы заблокированы.", show_alert=True)
         return
 
+    if callback.message.chat.type != "private":
+        await callback.answer("🎒 Перейдите в личные сообщения бота для просмотра инвентаря!", show_alert=True)
+        return
+
     await show_inventory(callback.from_user.id, callback)
     try:
         await callback.answer()
     except TelegramBadRequest:
         pass
+
+
+@router.callback_query(F.data.startswith("user_withdraw_"))
+async def process_user_withdraw(callback: CallbackQuery):
+    if await is_user_banned(callback.from_user.id):
+        await callback.answer("❌ Вы заблокированы.", show_alert=True)
+        return
+
+    if callback.message.chat.type != "private":
+        await callback.answer("🔒 Вывод средств доступен только в ЛС с ботом!", show_alert=True)
+        return
+
+    item_id = int(callback.data.split("_")[2])
+    item = await get_item_by_id(item_id)
+
+    if not item or item[1] != callback.from_user.id:
+        await callback.answer("❌ Предмет не найден или не принадлежит вам.", show_alert=True)
+        return
+
+    if item[6] != "available":
+        await callback.answer("⚠️ Данный предмет уже обрабатывается или передан.", show_alert=True)
+        return
+
+    await update_item_status(item_id, "pending")
+    gift_title = GIFTS_CONFIG.get(item[3], {}).get("title", "🎁")
+
+    await callback.answer("🚀 Заявка на вывод отправлена администратору!", show_alert=True)
+    await show_inventory(callback.from_user.id, callback)
+
+    if ADMIN_ID:
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"📥 <b>НОВАЯ ЗАЯВКА НА ВЫВОД!</b>\n\n"
+                f"👤 Игрок: {item[2]} (ID: <code>{item[1]}</code>)\n"
+                f"🎁 Приз: <b>{gift_title}</b>\n"
+                f"⭐ Номинал: <b>{item[4]} ⭐</b>\n"
+                f"💳 К выплате: <b>{item[5]} ⭐</b>",
+                parse_mode="HTML",
+                reply_markup=get_admin_approval_kb(item_id),
+            )
+        except Exception:
+            pass
 
 
 @router.callback_query(F.data == "clear_my_inventory")
@@ -889,10 +1082,35 @@ async def process_claim_win(callback: CallbackQuery):
     )
 
 
-# ==================== ОБРАБОТКА ИГРЫ В ГРУППАХ ====================
+# ==================== ОБРАБОТКА ИГРЫ В ГРУППАХ И ЛС ====================
 @router.message(F.dice & (F.dice.emoji == "🎰"))
 async def handle_dice(message: Message):
     if await is_user_banned(message.from_user.id):
+        return
+
+    # Запрет крутить в ЛС с ботом
+    if message.chat.type == "private":
+        await message.reply(
+            f"⚠️ <b>Внимание!</b> Крутить 🎰 можно только в нашем чате: @{ALLOWED_GROUP_USERNAME}",
+            parse_mode="HTML",
+        )
+        return
+
+    # Проверка разрешенной группы
+    chat_uname = (message.chat.username or "").lower()
+    if chat_uname != ALLOWED_GROUP_USERNAME.lower():
+        auto_leave = await get_setting("auto_leave_other_chats", "1")
+        if auto_leave == "1":
+            try:
+                await message.reply(
+                    f"❌ Бот работает исключительно в группе @{ALLOWED_GROUP_USERNAME}! Покидаю чат."
+                )
+            except Exception:
+                pass
+            try:
+                await bot.leave_chat(message.chat.id)
+            except Exception:
+                pass
         return
 
     # Защита от пересылки сообщений
@@ -937,8 +1155,7 @@ async def handle_dice(message: Message):
             )
         return
 
-    if message.chat.type in ["group", "supergroup"]:
-        await register_chat(message.chat.id, message.chat.title or "Группа")
+    await register_chat(message.chat.id, message.chat.title or "Группа", chat_uname)
 
     await register_user(
         message.from_user.id,
@@ -951,7 +1168,7 @@ async def handle_dice(message: Message):
     spent_stars = spins_cnt * spin_price
 
     if message.dice.value == 64:
-        gift_key = select_gift_by_spins(spent_stars)
+        gift_key = select_gift_by_spins(spent_stars, spin_price)
         gift = GIFTS_CONFIG[gift_key]
 
         username = (
@@ -961,7 +1178,7 @@ async def handle_dice(message: Message):
         )
 
         item_id = await add_item_to_inventory(
-            message.from_user.id, username, gift_key
+            message.from_user.id, username, gift_key, message.chat.id
         )
         await reset_user_spins(message.from_user.id)
 
@@ -1016,54 +1233,6 @@ async def handle_dice(message: Message):
             pass
 
 
-# ==================== ВЫВОД ПРИЗОВ ====================
-@router.callback_query(F.data.startswith("user_withdraw_"))
-async def process_user_withdraw(callback: CallbackQuery):
-    if await is_user_banned(callback.from_user.id):
-        await callback.answer("❌ Вы заблокированы.", show_alert=True)
-        return
-
-    item_id = int(callback.data.split("_")[2])
-    item = await get_item_by_id(item_id)
-
-    if not item or item[6] != "available":
-        await callback.answer(
-            "❌ Этот приз недоступен или уже обрабатывается.",
-            show_alert=True,
-        )
-        return
-
-    await update_item_status(item_id, "pending")
-    gift_key = item[3]
-    stars = item[4]
-    payout = item[5]
-    username = item[2]
-    gift_title = GIFTS_CONFIG.get(gift_key, {}).get("title", "🎁 Приз")
-
-    try:
-        await callback.message.edit_text(
-            f"⏳ <b>Заявка на вывод принята!</b>\n\n"
-            f"🎁 Приз: <b>{gift_title}</b> ({stars} ⭐)\n"
-            f"💳 Сумма к получению: <b>{payout} ⭐</b>\n\n"
-            f"ℹ️ <i>Заявка передана администратору. Обычный срок вывода составляет 7–10 дней "
-            f"(в зависимости от загруженности и наличия звёзд — до 1 месяца).</i>",
-            parse_mode="HTML",
-        )
-    except TelegramBadRequest:
-        pass
-
-    await bot.send_message(
-        ADMIN_ID,
-        f"🚨 <b>НОВАЯ ЗАЯВКА НА ВЫВОД!</b>\n\n"
-        f"👤 Пользователь: {username} (ID: <code>{item[1]}</code>)\n"
-        f"🎁 Подарок: <b>{gift_title}</b>\n"
-        f"⭐ Номинал: <b>{stars} ⭐</b>\n"
-        f"💳 К выплате: <b>{payout} ⭐</b>",
-        parse_mode="HTML",
-        reply_markup=get_admin_approval_kb(item_id),
-    )
-
-
 # ==================== ИМИТАЦИЯ И ТЕСТ ЛУДКИ ====================
 @router.message(Command("testludka"))
 async def cmd_testludka(message: Message):
@@ -1075,10 +1244,9 @@ async def cmd_testludka(message: Message):
 
     spin_price = await get_spin_price()
 
-    # Имитация реального демо-прокрута в чате
     spins_before_win = random.randint(1, 40)
     spent_stars = spins_before_win * spin_price
-    gift_key = select_gift_by_spins(spent_stars)
+    gift_key = select_gift_by_spins(spent_stars, spin_price)
     gift = GIFTS_CONFIG[gift_key]
 
     username = (
@@ -1087,9 +1255,8 @@ async def cmd_testludka(message: Message):
         else message.from_user.full_name
     )
 
-    # Зачисление подарка в инвентарь админа
     item_id = await add_item_to_inventory(
-        message.from_user.id, username, gift_key
+        message.from_user.id, username, gift_key, message.chat.id
     )
 
     demo_chat_text = (
@@ -1113,7 +1280,6 @@ async def cmd_testludka(message: Message):
 
     await message.answer(demo_chat_text, parse_mode="HTML", reply_markup=reply_markup)
 
-    # Проведение массовой симуляции для отчета
     total_jackpots = 0
     total_spins = 0
     gift_counts = {k: 0 for k in GIFTS_CONFIG.keys()}
@@ -1126,7 +1292,7 @@ async def cmd_testludka(message: Message):
             if random.randint(1, 64) == 64:
                 total_jackpots += 1
                 stars_spent = spins * spin_price
-                g_key = select_gift_by_spins(stars_spent)
+                g_key = select_gift_by_spins(stars_spent, spin_price)
                 gift_counts[g_key] += 1
                 break
 
@@ -1144,7 +1310,6 @@ async def cmd_testludka(message: Message):
         title = GIFTS_CONFIG[k]["title"]
         report += f"• {title}: <b>{v} шт.</b> ({pct}%)\n"
 
-    # ОТПРАВКА ОТЧЕТА И ВЫДАЧА ДЕМО-ПОДАРКА СТРОГО В ЛС АДМИНУ
     try:
         await bot.send_message(
             message.from_user.id,
@@ -1227,12 +1392,30 @@ async def process_admin_withdrawals_list(callback: CallbackQuery):
         if nav_buttons:
             keyboard.append(nav_buttons)
         keyboard.append(
+            [InlineKeyboardButton(text="🧹 Очистить все заявки", callback_data="clear_pending_withdrawals")]
+        )
+        keyboard.append(
             [InlineKeyboardButton(text="⬅️ Назад в Админку", callback_data="admin_back")]
         )
         kb = InlineKeyboardMarkup(inline_keyboard=keyboard)
 
     try:
         await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data == "clear_pending_withdrawals")
+async def process_clear_pending_withdrawals(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+    count = await clear_all_pending_withdrawals()
+    await callback.answer(f"🧹 Сброшено {count} заявок обратно в доступные призы!", show_alert=True)
+    spin_price = await get_spin_price()
+    kb = await get_admin_panel_kb(spin_price)
+    try:
+        await callback.message.edit_text("⚙️ <b>Панель Администратора</b>", parse_mode="HTML", reply_markup=kb)
     except TelegramBadRequest:
         pass
 
@@ -1496,6 +1679,92 @@ async def process_users_list(callback: CallbackQuery):
         pass
 
 
+# ==================== УПРАВЛЕНИЕ ПОДКЛЮЧЕННЫМИ ГРУППАМИ ====================
+def _get_connected_chats_sync():
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute("SELECT chat_id, title, username FROM chats")
+        return cursor.fetchall()
+
+
+def _delete_chat_sync(chat_id: int):
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.cursor()
+        cursor.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
+        db.commit()
+
+
+@router.callback_query(F.data == "admin_chats_menu")
+async def process_admin_chats_menu(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+    chats = await asyncio.to_thread(_get_connected_chats_sync)
+    auto_leave = await get_setting("auto_leave_other_chats", "1")
+
+    text = (
+        f"💬 <b>Настройка Подключённых Групп</b>\n\n"
+        f"🔒 Разрешённый юзернейм чата: <b>@{ALLOWED_GROUP_USERNAME}</b>\n"
+        f"🤖 Автовыход из других чатов: <b>{'ВКЛЮЧЕН' if auto_leave == '1' else 'ВЫКЛЮЧЕН'}</b>\n\n"
+    )
+
+    if not chats:
+        text += "❌ В базе пока нет зарегистрированной группы. Добавьте бота в ваш чат!"
+    else:
+        text += "<b>Текущие группы в базе:</b>\n"
+        for cid, ctitle, cuser in chats:
+            c_str = f"@{cuser}" if cuser else "Без юзернейма"
+            text += f"• <b>{ctitle}</b> ({c_str}) | ID: <code>{cid}</code>\n"
+
+    kb_buttons = [
+        [
+            InlineKeyboardButton(
+                text=f"⚙️ Автовыход: {'🟢 ВКЛ' if auto_leave == '1' else '🔴 ВЫКЛ'}",
+                callback_data="toggle_auto_leave",
+            )
+        ]
+    ]
+
+    if chats:
+        for cid, ctitle, _ in chats:
+            kb_buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"🗑️ Удалить группу #{cid}",
+                        callback_data=f"delete_chat_{cid}",
+                    )
+                ]
+            )
+
+    kb_buttons.append([InlineKeyboardButton(text="⬅️ Назад в Админку", callback_data="admin_back")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data == "toggle_auto_leave")
+async def process_toggle_auto_leave(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    curr = await get_setting("auto_leave_other_chats", "1")
+    next_val = "0" if curr == "1" else "1"
+    await set_setting("auto_leave_other_chats", next_val)
+    await process_admin_chats_menu(callback)
+
+
+@router.callback_query(F.data.startswith("delete_chat_"))
+async def process_delete_chat(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    cid = int(callback.data.split("_")[2])
+    await asyncio.to_thread(_delete_chat_sync, cid)
+    await callback.answer("🗑️ Группа удалена из базы бота!", show_alert=True)
+    await process_admin_chats_menu(callback)
+
+
 # ==================== АДМИН-ПАНЕЛЬ И МОДЕРАЦИЯ ====================
 @router.message(Command("admin"))
 async def cmd_admin(message: Message):
@@ -1716,6 +1985,52 @@ async def process_change_warn_mute_time(
         "⏱️ Введите время мута при 4 варнах в минутах (например 1440 = 24ч):"
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "mod_act_clear_all_inv")
+async def process_clear_all_inv_confirm(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔥 ДА, очистить абсолютно ВСЕ инвентари", callback_data="confirm_clear_all_inv"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отмена", callback_data="admin_mod_menu"
+                )
+            ]
+        ]
+    )
+    await callback.message.edit_text(
+        "⚠️ <b>ВЫ УВЕРЕНЫ?</b>\nЭто действие приведет к окончательному удалению ВСЕХ предметов у ВСЕХ пользователей!",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+@router.callback_query(F.data == "confirm_clear_all_inv")
+async def process_confirm_clear_all_inv(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+    await clear_all_inventories()
+    await callback.answer("💥 Все инвентари пользователей успешно очищены!", show_alert=True)
+    await process_mod_menu(callback)
+
+
+@router.callback_query(F.data == "mod_act_clear_bugged_gifts")
+async def process_clear_bugged_gifts(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+    del_count = await clear_bugged_pm_gifts()
+    await callback.answer(f"🧹 Успешно удалено {del_count} багованных предметов из инвентарей!", show_alert=True)
+    await process_mod_menu(callback)
 
 
 @router.callback_query(F.data.startswith("mod_act_"))
@@ -2010,7 +2325,7 @@ async def process_broadcast_start(
     target_name = (
         "в Личные Сообщения пользователям"
         if target == "pm"
-        else "в Группы/Чаты"
+        else f"в Группу (@{ALLOWED_GROUP_USERNAME})"
     )
     await callback.message.reply(
         f"📢 Отправьте сообщение для рассылки {target_name}:"
@@ -2024,7 +2339,7 @@ def _get_broadcast_targets_sync(target: str):
         if target == "pm":
             cursor.execute("SELECT user_id FROM users")
         else:
-            cursor.execute("SELECT chat_id FROM chats")
+            cursor.execute("SELECT chat_id FROM chats WHERE LOWER(username) = LOWER(?)", (ALLOWED_GROUP_USERNAME,))
         return [row[0] for row in cursor.fetchall()]
 
 
